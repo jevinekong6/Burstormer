@@ -22,7 +22,7 @@ class Args:
     def __init__(self):
         self.dataset_root = "./gopro_dataset"   # output of build_bursts.py
         self.model_dir = log_dir + "saved_model"
-        self.NUM_WORKERS = 6
+        self.NUM_WORKERS = 6    
 
 
 args = Args()
