@@ -38,6 +38,13 @@ python tools/extract_frames.py --video my_video.mp4 --spec my_timestamps.txt --o
 ```
 Each group is written to its own folder (one burst, ordered as in the spec, first frame = reference) together with a `manifest.csv`. Use `--dry_run` to preview the frame indices first.
 
+### Co-registering the extracted bursts
+Frames from different passes are badly misaligned, so a separate pre-processing step aligns each burst to its reference frame (the first one). It uses SIFT features on lighting-equalised grayscale, a RANSAC/MAGSAC homography and optional ECC sub-pixel refinement, then crops every frame to the largest rectangle they all share:
+```
+python tools/coregister_bursts.py --in_dir ./custom_bursts --out_dir ./custom_bursts_aligned --ecc --debug
+```
+Frames with too few matches or too little overlap (`--min_overlap`, default 0.5) are rejected. `alignment.csv` lists per-frame inliers, overlap and correlation with the reference, `homographies.json` stores the transforms, and `--debug` writes checkerboard blends to `_debug/` for visual checks. Homographies assume a roughly planar scene: tall structures will show parallax, and GoPro wide/fisheye distortion should be avoided (Linear mode) or removed first.
+
 ## Citation
 If you use Burstormer, please consider citing:
     
