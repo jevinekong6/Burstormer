@@ -1,0 +1,16 @@
+# Example timestamp spec for tools/extract_frames.py
+#
+#   [group:] <timestamp>                               -> one frame
+#   [group:] <start> - <end> [every <N> | every <X>s]  -> frames from a range
+#
+# Timestamps: HH:MM:SS(.ms), MM:SS(.ms) or seconds. Frames sharing a group
+# end up in the same folder (= one burst); the first entry is the reference frame.
+
+# Same building, three passes at different angles / elevations / lighting
+building: 00:01:23.50                      # pass 1, single frame (reference)
+building: 00:04:02                         # pass 2, single frame
+building: 00:07:10 - 00:07:40 every 100    # pass 3, every 100th frame
+
+# Field, sampled every 2 seconds over two passes
+field: 95.2 - 105 every 2s
+field: 12:30 - 12:40 every 2s

@@ -25,6 +25,19 @@ See [install.yml](install.yml) for the installation of dependencies required to 
 conda env create -f install.yml
 ```
 
+## Extracting custom bursts from video
+`tools/extract_frames.py` builds bursts from hand-picked video timestamps, e.g. the same scene captured on different passes (angles, elevations, lighting) rather than consecutive frames. Write a spec file (see `tools/example_timestamps.txt`):
+```
+building: 00:01:23.50                     # single frame
+building: 00:07:10 - 00:07:40 every 100   # every 100th frame in a range
+field: 95.2 - 105 every 2s                # one frame every 2 seconds
+```
+then run
+```
+python tools/extract_frames.py --video my_video.mp4 --spec my_timestamps.txt --out_dir ./custom_bursts
+```
+Each group is written to its own folder (one burst, ordered as in the spec, first frame = reference) together with a `manifest.csv`. Use `--dry_run` to preview the frame indices first.
+
 ## Citation
 If you use Burstormer, please consider citing:
     
