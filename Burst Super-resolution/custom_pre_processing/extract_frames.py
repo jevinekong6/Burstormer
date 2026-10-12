@@ -47,7 +47,7 @@ def extract_clip(input_path: Path, outdir: Path, every: int, start: str, end: st
         cmd += ["-to", end]
     cmd += [
         "-vf", vf,
-        "-vsync", "vfr",       # don't let ffmpeg pad/duplicate frames to match a rate
+        "-fps_mode", "vfr",       # don't let ffmpeg pad/duplicate frames to match a rate
         "-pix_fmt", "rgb24",
         str(outdir / "frame_%06d.png"),  # lossless -- avoid re-compressing on top of H.264/H.265
     ]

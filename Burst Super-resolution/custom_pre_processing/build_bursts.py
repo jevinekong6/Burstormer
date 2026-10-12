@@ -1,77 +1,92 @@
 #!/usr/bin/env python3
 """Group extracted GoPro frames into bursts, coregister them, and write a
-training-ready LR/HR dataset for the Option-B (RGB-native) Burstormer.
+randomized-degradation LR/HR training set for comparing burst-SR models
+(Burstormer / FBAnet / SBFNet) under non-trivial degradation.
 
-Pipeline per burst window:
-  1. Take `burst_size` consecutive frames; the CENTER frame is the reference
-     (minimizes the max temporal/geometric gap any neighbor has to cover,
-     vs. picking the first frame).
-  2. Align every other frame to the reference. Alignment is estimated on a
-     DOWNSCALED copy of each frame pair (--align_max_dim, default 640px on
-     the long side) -- cv2.findTransformECC (homography) first, ORB+RANSAC
-     homography as a fallback if ECC doesn't converge -- and the resulting
-     homography is rescaled back to full resolution before warping. This is
-     the single biggest lever on runtime: ECC's cost scales with pixel
-     count, so running it at native 4K/5.3K resolution is 20-50x slower
-     than necessary for no real accuracy gain -- the final LR frames get
-     downsampled by --sr_factor anyway, so registration only needs to be
-     accurate to well within a native pixel. (Benchmarked: ~22s/frame-pair
-     at native 3840x2160 vs. ~0.5s/frame-pair at 640px, same resulting
-     alignment accuracy.) Frames that fail both methods are dropped from
-     that burst -- Burstormer's adaptive burst pooling tolerates a variable
-     burst size, so this is safe rather than padding with garbage.
-  3. Intersect the valid (non-black-border) regions of all warped frames,
-     shrink by --border_margin, and sample one or more --patch_size crops
-     from that common region. Each candidate crop is screened before it's
-     accepted:
-       - --min_laplacian_var rejects crops that are too FLAT/low-detail
-         (sky, still water, blank walls, out-of-focus background). This is
-         a texture/focus measure, not a color one.
-       - --max_vegetation_frac rejects crops where more than that fraction
-         of pixels look green/foliage-colored (grass, leaves, trees), via
-         a rough HSV heuristic. This is a SEPARATE filter from the texture
-         one on purpose: grass/foliage is usually HIGH local variance (lots
-         of fine edges), so a flatness filter alone won't catch it -- what
-         makes it a poor MFSR target is that the fine detail tends to be
-         repetitive/aliased rather than genuinely recoverable structure,
-         and it's cheap to flag by color instead of trying to distinguish
-         "good" high-frequency detail from "bad" high-frequency detail with
-         a single texture number. Note this heuristic will also flag other
-         green content (painted walls, green fabric, etc.) -- it's a proxy,
-         not semantic segmentation.
-     Each candidate location is retried up to --texture_max_attempts times
-     before that patch slot is given up on (skipped, not padded).
-  4. The reference crop (native resolution) becomes the HR ground truth.
-     Every frame in the aligned burst (reference included, as burst[0]) is
-     downsampled by --sr_factor to build the LR input burst.
-  5. Everything is written to disk as
+Input: folders of already-extracted sRGB frames, one folder per clip, e.g.
+    frames/GX010087/frame_000001.png
+    frames/GX010087/frame_000002.png
+    ...
+Point --frames_dir at the parent ("frames") and pass --multi_clip; each
+subfolder is treated as one clip. (--multi_clip off treats --frames_dir
+itself as a single clip's frame folder.)
+
+Pipeline per burst window (burst_size consecutive frames, center frame is
+the reference):
+  1. Every other frame's homography to the reference is estimated on a
+     DOWNSCALED copy (--align_max_dim, default 640px) via ECC, with
+     ORB+RANSAC as a fallback, then rescaled to full resolution. This is
+     just for speed -- ECC's cost scales with pixel count and native-4K
+     alignment is 20-50x slower for no accuracy benefit, since the final
+     LR frames get downsampled by --sr_factor anyway.
+  2. NOTHING IS WARPED. Each candidate patch is cropped directly from each
+     frame's own unwarped pixels, at an origin shifted by the estimated
+     displacement rounded to the nearest whole LR pixel (a multiple of
+     sr_factor HR pixels). Warping/interpolating a frame onto the
+     reference grid destroys the sub-HR-pixel sampling phase that multi-
+     frame fusion actually exploits -- rounding to a whole LR pixel instead
+     leaves a genuine +/-0.5 LR px residual per frame, which is what makes
+     the burst informative rather than 14 near-duplicates. A frame is
+     dropped from a given patch if the homography's rotation/scale/
+     perspective component across that patch exceeds --max_nontranslation_px
+     (an integer-shift crop can't represent that, and interpolating to fix
+     it would undo the whole point) or if the shifted crop falls outside
+     the frame -- dropping is safe, adaptive burst pooling tolerates a
+     variable burst size.
+  3. Candidate patches are rejected if they're low-texture
+     (cv2.Laplacian variance < --min_laplacian_var) -- a flat/blurry patch
+     doesn't exercise multi-frame fusion or give any model something
+     meaningful to reconstruct.
+  4. The reference crop becomes HR ground truth. Every frame in the burst
+     is degraded HR->LR: Gaussian blur (optical PSF/sensor MTF) at HR
+     before downsampling, then heteroscedastic shot+read sensor noise at
+     LR after it -- both RANDOMIZED so no model can shortcut to inverting
+     one fixed degradation instead of learning a general operator. Both the
+     blur sigma AND the shot/read noise LEVEL (variance) are drawn ONCE PER
+     WINDOW, shared by every frame/patch cut from that burst -- this matches
+     real camera behavior (optical PSF and ISO/gain are both fixed for the
+     duration of one capture) and matches Burstormer's own synthetic-burst
+     generator, which samples its noise level once per burst too. What is
+     NOT shared per frame is the actual injected noise VALUES -- those are
+     freshly randomized every frame regardless, since real sensor noise
+     realizations (unlike the level/variance) genuinely are independent
+     shot to shot. This replaces a plain INTER_AREA box-downsample
+     degradation, which is exactly invertible and does not exercise a
+     model's robustness to real degradation.
+  5. Output:
          out/<split>/<clip>_w<window>_p<patch>/hr.png
          out/<split>/<clip>_w<window>_p<patch>/lr/im_00.png ... im_{k-1}.png
          out/<split>/<clip>_w<window>_p<patch>/meta.json
-     which `gopro_burst_dataset.py` reads directly. Scene names are derived
-     from (clip, window, patch) rather than a shared running counter, so
-     windows can be processed in parallel across worker processes without
-     any coordination. meta.json also records each patch's laplacian_var
-     and vegetation_frac so you can audit what got kept/dropped later.
+     Scene names are derived from (clip, window, patch), so --workers N
+     (ProcessPoolExecutor, one process per window) never collides.
 
 Usage:
-    python build_bursts.py --frames_dir frames/GX010001 --outdir dataset \
-        --burst_size 14 --sr_factor 4 --patch_size 384 --patches_per_window 2
+    # single clip
+    python build_bursts.py --frames_dir frames/GX010087 --outdir dataset \
+        --blur_sigma_min 0.4 --blur_sigma_max 1.2 \
+        --shot_noise_min 0.0004 --shot_noise_max 0.0012 \
+        --read_noise_min 0.002 --read_noise_max 0.006
 
-    # multiple clips at once (recommended -- keeps scene naming from colliding)
+    # every clip folder under frames/, using all CPU cores
     python build_bursts.py --frames_dir frames --multi_clip --outdir dataset \
-        --burst_size 14 --sr_factor 4 --patch_size 384 --patches_per_window 2
+        --blur_sigma_min 0.4 --blur_sigma_max 1.2 \
+        --shot_noise_min 0.0004 --shot_noise_max 0.0012 \
+        --read_noise_min 0.002 --read_noise_max 0.006 --workers 8
 
-    # use all CPU cores (each window is independent work)
+    # Burstormer's own physically-correlated shot/read noise model instead
+    # of independent uniform draws (ignores --shot_noise_*/--read_noise_*)
     python build_bursts.py --frames_dir frames --multi_clip --outdir dataset \
-        --workers 8
+        --blur_sigma_min 0.4 --blur_sigma_max 1.2 --noise_model burstormer --workers 8
 
-    # skip flat sky/water AND grass/foliage-dominated patches
-    python build_bursts.py --frames_dir frames --multi_clip --outdir dataset \
-        --min_laplacian_var 15 --max_vegetation_frac 0.6 --texture_max_attempts 25
+IMPORTANT: build train and val with the SAME degradation settings (same
+--blur_sigma_min/max, --shot_noise_min/max, --read_noise_min/max,
+--noise_model) so a model's val performance reflects the same degradation
+distribution it trained on. The actual sampled values are written into every
+scene's meta.json regardless, for auditing.
 """
 import argparse
 import json
+import os
 import random
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
@@ -81,7 +96,7 @@ import numpy as np
 
 
 # --------------------------------------------------------------------------- #
-# Alignment
+# Alignment estimation
 # --------------------------------------------------------------------------- #
 
 def resize_for_alignment(img, max_dim):
@@ -92,14 +107,12 @@ def resize_for_alignment(img, max_dim):
     if scale >= 1.0:
         return img, 1.0
     small = cv2.resize(img, (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
-                        interpolation=cv2.INTER_AREA)
+                       interpolation=cv2.INTER_AREA)
     return small, scale
 
 
 def estimate_homography_ecc(ref_gray_f32, mov_gray_f32, iterations, eps):
-    """Returns H (in the SAME pixel coordinates as the inputs) such that
-    cv2.warpPerspective(mov, H, size) aligns mov -> ref, or None if ECC fails
-    to converge."""
+    """Returns H such that warpPerspective(mov, H, size) aligns mov -> ref."""
     warp_matrix = np.eye(3, 3, dtype=np.float32)
     criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, iterations, eps)
     try:
@@ -108,9 +121,6 @@ def estimate_homography_ecc(ref_gray_f32, mov_gray_f32, iterations, eps):
         )
     except cv2.error:
         return None
-    # findTransformECC(template=ref, input=mov, ...) returns the warp that
-    # needs WARP_INVERSE_MAP to send mov -> ref. Invert once here so every
-    # caller downstream can just do a plain forward warpPerspective(mov, H).
     try:
         return np.linalg.inv(warp_matrix).astype(np.float64)
     except np.linalg.LinAlgError:
@@ -118,7 +128,6 @@ def estimate_homography_ecc(ref_gray_f32, mov_gray_f32, iterations, eps):
 
 
 def estimate_homography_orb(ref_gray_u8, mov_gray_u8, min_matches=30):
-    """Returns H (in the SAME pixel coordinates as the inputs), or None."""
     orb = cv2.ORB_create(4000)
     kp_ref, des_ref = orb.detectAndCompute(ref_gray_u8, None)
     kp_mov, des_mov = orb.detectAndCompute(mov_gray_u8, None)
@@ -132,365 +141,477 @@ def estimate_homography_orb(ref_gray_u8, mov_gray_u8, min_matches=30):
     src_pts = np.float32([kp_mov[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
     dst_pts = np.float32([kp_ref[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
     H, _ = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 3.0)
-    if H is None:
-        return None
-    return H.astype(np.float64)  # already forward: mov -> ref
+    return None if H is None else H.astype(np.float64)
 
 
 def rescale_homography(H_small, scale):
-    """Converts a homography estimated on images downscaled by `scale`
-    (small = full * scale) into one that operates on full-resolution
-    coordinates directly."""
     if scale >= 1.0:
-        return H_small.astype(np.float32)
+        return H_small.astype(np.float64)
     T = np.array([[scale, 0, 0], [0, scale, 0], [0, 0, 1]], dtype=np.float64)
-    H_full = np.linalg.inv(T) @ H_small @ T
-    return H_full.astype(np.float32)
+    return (np.linalg.inv(T) @ H_small @ T).astype(np.float64)
 
 
-def align_frame(ref_bgr, mov_bgr, ecc_iterations, ecc_eps, align_max_dim):
-    """Returns (warped_bgr, valid_mask_u8, method) or (None, None, None) on failure.
-    Homography is ESTIMATED on downscaled copies (fast) and APPLIED at full
-    resolution (so the output is still native-res)."""
-    h, w = ref_bgr.shape[:2]
-
+def estimate_frame_homography(ref_bgr, mov_bgr, ecc_iterations, ecc_eps, align_max_dim):
+    """Returns (H_full, method) mapping mov -> ref at full resolution, or (None, None)."""
     ref_small, scale = resize_for_alignment(ref_bgr, align_max_dim)
-    mov_small, _ = resize_for_alignment(mov_bgr, align_max_dim)  # same input size -> same scale
-
-    ref_gray_small = cv2.cvtColor(ref_small, cv2.COLOR_BGR2GRAY)
-    mov_gray_small = cv2.cvtColor(mov_small, cv2.COLOR_BGR2GRAY)
+    mov_small, _ = resize_for_alignment(mov_bgr, align_max_dim)
+    ref_gray = cv2.cvtColor(ref_small, cv2.COLOR_BGR2GRAY)
+    mov_gray = cv2.cvtColor(mov_small, cv2.COLOR_BGR2GRAY)
 
     H_small = estimate_homography_ecc(
-        ref_gray_small.astype(np.float32) / 255.0, mov_gray_small.astype(np.float32) / 255.0,
+        ref_gray.astype(np.float32) / 255.0, mov_gray.astype(np.float32) / 255.0,
         ecc_iterations, ecc_eps,
     )
     method = "ecc"
     if H_small is None:
-        H_small = estimate_homography_orb(ref_gray_small, mov_gray_small)
+        H_small = estimate_homography_orb(ref_gray, mov_gray)
         method = "orb"
     if H_small is None:
-        return None, None, None
-
-    H_full = rescale_homography(H_small, scale)
-
-    warped = cv2.warpPerspective(
-        mov_bgr, H_full, (w, h), flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT, borderValue=0,
-    )
-    mask = cv2.warpPerspective(
-        np.full((h, w), 255, dtype=np.uint8), H_full, (w, h), flags=cv2.INTER_NEAREST,
-        borderMode=cv2.BORDER_CONSTANT, borderValue=0,
-    )
-    return warped, mask, method
+        return None, None
+    return rescale_homography(H_small, scale), method
 
 
 # --------------------------------------------------------------------------- #
-# Patch content filtering (texture / vegetation)
+# Integer-LR-pixel shift extraction (preserves sub-pixel diversity)
+# --------------------------------------------------------------------------- #
+
+def patch_displacement(H_ref_to_mov, px, py, size):
+    """Returns (dx, dy, nontranslation_px): mean corner displacement ref -> mov,
+    and the max deviation of any corner from that mean (0 for a pure translation;
+    nonzero means the homography applies rotation/scale/perspective across the
+    patch, which an integer-shift crop cannot represent)."""
+    corners = np.array([
+        [px, py], [px + size, py], [px + size, py + size], [px, py + size],
+    ], dtype=np.float64).reshape(-1, 1, 2)
+    mapped = cv2.perspectiveTransform(corners, H_ref_to_mov).reshape(-1, 2)
+    disp = mapped - corners.reshape(-1, 2)
+    mean_disp = disp.mean(axis=0)
+    nontrans = float(np.abs(disp - mean_disp).max())
+    return float(mean_disp[0]), float(mean_disp[1]), nontrans
+
+
+def snap_to_lr_grid(d, sr_factor):
+    """Rounds an HR-pixel displacement to the nearest whole LR pixel. Returns
+    (snapped_hr_int, residual_lr); the residual is the sub-pixel phase that
+    survives into the LR burst (should span roughly +/-0.5 across the burst) --
+    that residual is the entire signal multi-frame SR exploits."""
+    steps = int(np.round(d / sr_factor))
+    snapped = steps * sr_factor
+    residual_lr = (d - snapped) / sr_factor
+    return snapped, float(residual_lr)
+
+
+def extract_shifted_crop(frame, px, py, size, dx_int, dy_int):
+    """Crop `frame` at the reference patch origin offset by integer HR shifts.
+    Returns None if the crop falls outside the frame."""
+    x = px + dx_int
+    y = py + dy_int
+    h, w = frame.shape[:2]
+    if x < 0 or y < 0 or x + size > w or y + size > h:
+        return None
+    return frame[y:y + size, x:x + size]
+
+
+# --------------------------------------------------------------------------- #
+# Content filtering
 # --------------------------------------------------------------------------- #
 
 def laplacian_variance(gray_u8):
-    """Focus/texture measure: variance of the Laplacian. Low values mean a
-    flat, low-detail region (sky, still water, blank walls, out-of-focus
-    background); values well above the noise floor indicate genuine edges
-    or texture worth training on. Exact useful threshold depends on your
-    footage's exposure/compression -- audit meta.json's laplacian_var
-    values on a sample run before locking in --min_laplacian_var."""
-    lap = cv2.Laplacian(gray_u8, cv2.CV_64F)
-    return float(lap.var())
-
-
-def vegetation_fraction(bgr_u8):
-    """Rough heuristic fraction of pixels that look like foliage/grass:
-    green-dominant hue in HSV, with enough saturation/value to exclude
-    near-gray or near-black/white pixels. This is a COLOR heuristic, not a
-    texture one -- grass and leaves are often high local variance (lots of
-    fine edges), so laplacian_variance() alone won't catch them; this
-    filter targets them by color instead. It will also flag other green
-    content (painted walls, green fabric, astroturf, etc.) -- it's a cheap
-    proxy, not semantic segmentation."""
-    hsv = cv2.cvtColor(bgr_u8, cv2.COLOR_BGR2HSV)
-    h, s, v = cv2.split(hsv)
-    # OpenCV hue range is 0-179; green foliage typically falls ~35-85.
-    green_mask = (h >= 35) & (h <= 85) & (s > 40) & (v > 30)
-    return float(green_mask.mean())
-
-
-def evaluate_patch_content(ref_crop_bgr, min_laplacian_var, max_vegetation_frac):
-    """Returns (passes, laplacian_var, vegetation_frac). Only computes the
-    vegetation heuristic when it's actually active (max_vegetation_frac < 1.0),
-    since it's the pricier of the two checks."""
-    gray = cv2.cvtColor(ref_crop_bgr, cv2.COLOR_BGR2GRAY)
-    lap_var = laplacian_variance(gray)
-
-    if lap_var < min_laplacian_var:
-        return False, lap_var, 0.0
-
-    if max_vegetation_frac < 1.0:
-        veg_frac = vegetation_fraction(ref_crop_bgr)
-        if veg_frac > max_vegetation_frac:
-            return False, lap_var, veg_frac
-    else:
-        veg_frac = 0.0
-
-    return True, lap_var, veg_frac
+    return float(cv2.Laplacian(gray_u8, cv2.CV_64F).var())
 
 
 # --------------------------------------------------------------------------- #
-# Burst assembly
+# Degradation
 # --------------------------------------------------------------------------- #
 
-def common_valid_bbox(masks, border_margin):
-    """Intersection of a list of 0/255 masks, eroded by border_margin, as (x, y, w, h)."""
-    inter = masks[0].copy()
-    for m in masks[1:]:
-        inter = cv2.bitwise_and(inter, m)
-    if border_margin > 0:
-        kernel = np.ones((border_margin * 2 + 1, border_margin * 2 + 1), np.uint8)
-        inter = cv2.erode(inter, kernel)
-    ys, xs = np.where(inter > 0)
-    if len(xs) == 0:
-        return None
-    x0, x1 = xs.min(), xs.max()
-    y0, y1 = ys.min(), ys.max()
-    return x0, y0, x1 - x0 + 1, y1 - y0 + 1
+def degrade_to_lr(hr_bgr_u8, sr_factor, blur_sigma, read_noise, shot_noise, rng_np):
+    """HR uint8 BGR -> LR uint8 BGR. Blur (optical PSF/sensor MTF) is applied at
+    HR before downsampling; shot+read sensor noise is added at LR after it --
+    that ordering mirrors a real camera. shot_noise is signal-dependent
+    (variance proportional to intensity), read_noise is not; both in [0,1]
+    normalized units."""
+    img = hr_bgr_u8.astype(np.float32) / 255.0
 
+    if blur_sigma > 0:
+        k = int(2 * np.ceil(3 * blur_sigma) + 1)
+        img = cv2.GaussianBlur(img, (k, k), blur_sigma, borderType=cv2.BORDER_REFLECT)
+
+    lr_size = hr_bgr_u8.shape[0] // sr_factor
+    lr = cv2.resize(img, (lr_size, lr_size), interpolation=cv2.INTER_AREA)
+
+    if shot_noise > 0 or read_noise > 0:
+        var = shot_noise * np.clip(lr, 0, None) + read_noise ** 2
+        lr = lr + rng_np.normal(0.0, 1.0, lr.shape).astype(np.float32) * np.sqrt(var)
+
+    return (np.clip(lr, 0, 1) * 255.0).round().astype(np.uint8)
+
+
+def sample_noise_levels_burstormer(rng_np):
+    """Physically-correlated (shot, read) noise levels for one frame, matching
+    Burstormer's own camera_pipeline.random_noise_levels() (Brooks et al., CVPR
+    2019, "Unprocessing Images for Learned Raw Denoising"): log_shot ~ uniform
+    over log([1e-4, 0.012]); log_read is a linear regression on log_shot fit to
+    real sensor calibration data, plus Gaussian scatter."""
+    log_min, log_max = np.log(1e-4), np.log(0.012)
+    log_shot = rng_np.uniform(log_min, log_max)
+    shot_noise = float(np.exp(log_shot))
+    log_read = 2.18 * log_shot + 1.20 + rng_np.normal(0.0, 0.26)
+    read_noise = float(np.exp(log_read))
+    return shot_noise, read_noise
+
+
+def sample_window_noise(cfg, rng_np):
+    """One (shot_noise, read_noise) LEVEL draw per WINDOW, shared by every frame in
+    that burst -- these are the ISO/gain-driven noise-variance parameters, which are
+    a camera setting fixed for the duration of one capture, not something that
+    changes frame to frame within a single burst. This is also what Burstormer's own
+    camera_pipeline does: rgb2rawburst() calls random_noise_levels() ONCE per burst
+    and reuses that one level for every frame via add_noise().
+
+    This is NOT the same as randomizing the actual injected noise per frame -- the
+    noise VALUES still differ frame to frame (and pixel to pixel) because
+    degrade_to_lr() draws a fresh rng_np.normal(...) sample every time it's called,
+    once per frame. What's shared across the burst is only the noise LEVEL
+    (variance), matching a fixed ISO/gain; what's independent per frame is the
+    actual noise realization, matching independent photon/readout statistics.
+
+    'burstormer' uses the physically-correlated model above; 'uniform' draws each
+    independently from its configured range."""
+    if cfg["noise_model"] == "burstormer":
+        return sample_noise_levels_burstormer(rng_np)
+    shot_lo, shot_hi = cfg["shot_noise_min"], cfg["shot_noise_max"]
+    read_lo, read_hi = cfg["read_noise_min"], cfg["read_noise_max"]
+    shot_noise = float(rng_np.uniform(shot_lo, shot_hi)) if shot_hi > shot_lo else shot_lo
+    read_noise = float(rng_np.uniform(read_lo, read_hi)) if read_hi > read_lo else read_lo
+    return shot_noise, read_noise
+
+
+def sample_window_blur(cfg, rng_np):
+    """One blur sigma per WINDOW, shared by every frame/patch cut from that
+    burst -- real optical PSF/focus is essentially constant across the ~0.5s a
+    burst spans, so per-frame blur randomization would model a physical effect
+    that doesn't happen. Randomizing per-window still stops a model from
+    learning to invert one fixed blur kernel across the whole dataset."""
+    lo, hi = cfg["blur_sigma_min"], cfg["blur_sigma_max"]
+    return float(rng_np.uniform(lo, hi)) if hi > lo else lo
+
+
+def measure_phase_spread(lr_frames_u8):
+    """Phase correlation of each LR frame against LR frame 0 -- the audit that
+    tells you whether the sub-pixel-shift fix achieved anything on your actual
+    footage: want mean |d| well above ~0.15 and spread reaching toward 1.0 LR px."""
+    if len(lr_frames_u8) < 2:
+        return 0.0, 0.0
+    gray = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY).astype(np.float32) for f in lr_frames_u8]
+    win = cv2.createHanningWindow((gray[0].shape[1], gray[0].shape[0]), cv2.CV_32F)
+    mags = []
+    for g in gray[1:]:
+        (dx, dy), _ = cv2.phaseCorrelate(gray[0], g, win)
+        mags.append(float(np.hypot(dx, dy)))
+    return float(np.mean(mags)), float(np.max(mags))
+
+
+# --------------------------------------------------------------------------- #
+# Window assembly
+# --------------------------------------------------------------------------- #
 
 def build_window(frames_bgr, ecc_iterations, ecc_eps, min_valid_frames, align_max_dim):
-    """Aligns every frame in the window to the center frame.
-    Returns (aligned_bgr_list, masks_list, ref_index_in_window, methods) with
-    the reference itself first in the returned lists."""
+    """Estimates every frame's homography to the CENTER frame. Nothing is
+    warped -- extraction happens per-patch in sample_patches(). Returns
+    (ref_idx, entries) where entries[i] is
+    (frame_index_in_window, H_mov_to_ref, H_ref_to_mov, method), reference first."""
     ref_idx = len(frames_bgr) // 2
     ref = frames_bgr[ref_idx]
-    h, w = ref.shape[:2]
-
-    aligned = [ref]
-    masks = [np.full((h, w), 255, dtype=np.uint8)]
-    methods = ["reference"]
+    eye = np.eye(3, dtype=np.float64)
+    entries = [(ref_idx, eye, eye, "reference")]
 
     for i, frame in enumerate(frames_bgr):
         if i == ref_idx:
             continue
-        warped, mask, method = align_frame(ref, frame, ecc_iterations, ecc_eps, align_max_dim)
-        if warped is None:
+        H, method = estimate_frame_homography(ref, frame, ecc_iterations, ecc_eps, align_max_dim)
+        if H is None:
             continue
-        aligned.append(warped)
-        masks.append(mask)
-        methods.append(method)
+        try:
+            H_inv = np.linalg.inv(H)
+        except np.linalg.LinAlgError:
+            continue
+        entries.append((i, H, H_inv, method))
 
-    if len(aligned) < min_valid_frames:
+    if len(entries) < min_valid_frames:
         return None
+    return ref_idx, entries
 
-    return aligned, masks, ref_idx, methods
 
+def sample_patches(frames_bgr, ref_idx, entries, patch_size, patches_per_window,
+                   border_margin, rng, sr_factor, max_nontranslation_px,
+                   min_valid_frames, min_laplacian_var=0.0, max_attempts=25):
+    """Samples crops, extracting each frame at its own integer-LR-pixel offset."""
+    ref = frames_bgr[ref_idx]
+    h, w = ref.shape[:2]
 
-def sample_patches(aligned, masks, patch_size, patches_per_window, border_margin, rng,
-                    min_laplacian_var=0.0, max_vegetation_frac=1.0, max_attempts=20):
-    """Samples up to `patches_per_window` crops from the common valid region.
+    # Conservative inset: the largest center displacement any frame needs.
+    cx, cy = w // 2, h // 2
+    max_shift = 0.0
+    for _, _, H_inv, _ in entries:
+        dx, dy, _ = patch_displacement(H_inv, cx, cy, 1)
+        max_shift = max(max_shift, abs(dx), abs(dy))
+    inset = int(np.ceil(max_shift)) + border_margin + sr_factor
 
-    If min_laplacian_var > 0 or max_vegetation_frac < 1.0, each candidate
-    location is screened via evaluate_patch_content() on the REFERENCE
-    frame's crop (aligned[0] -- the frame that becomes hr.png, and the most
-    representative single frame for the burst's content). A candidate that
-    fails is discarded and a new random location is tried, up to
-    max_attempts times, before that patch slot is given up on. This means a
-    window can end up with fewer than patches_per_window patches (or zero)
-    if it's dominated by flat/vegetation content -- that's intentional,
-    same "skip rather than pad with garbage" philosophy as frame alignment.
-
-    Returns a list of (crop_frames, (px, py), metrics_dict) tuples, where
-    metrics_dict has "laplacian_var" and "vegetation_frac" for the frame
-    that was ACCEPTED (0.0 filler values when filtering is fully disabled).
-    """
-    bbox = common_valid_bbox(masks, border_margin)
-    if bbox is None:
-        return []
-    x0, y0, bw, bh = bbox
-    if bw < patch_size or bh < patch_size:
+    lo_x, hi_x = inset, w - inset - patch_size
+    lo_y, hi_y = inset, h - inset - patch_size
+    if hi_x <= lo_x or hi_y <= lo_y:
         return []
 
-    filtering_enabled = (min_laplacian_var > 0.0) or (max_vegetation_frac < 1.0)
-    attempts_per_patch = max_attempts if filtering_enabled else 1
+    filtering = min_laplacian_var > 0.0
+    attempts = max_attempts if filtering else 1
 
     patches = []
     for _ in range(patches_per_window):
         accepted = None
-        for _attempt in range(attempts_per_patch):
-            px = rng.randint(x0, x0 + bw - patch_size)
-            py = rng.randint(y0, y0 + bh - patch_size)
+        for _a in range(attempts):
+            px = rng.randint(lo_x, hi_x)
+            py = rng.randint(lo_y, hi_y)
+            ref_crop = ref[py:py + patch_size, px:px + patch_size]
+            lap = laplacian_variance(cv2.cvtColor(ref_crop, cv2.COLOR_BGR2GRAY)) if filtering else 0.0
+            if filtering and lap < min_laplacian_var:
+                continue
 
-            if not filtering_enabled:
-                accepted = (px, py, 0.0, 0.0)
-                break
+            crops, frame_meta = [], []
+            for widx, H, H_inv, method in entries:
+                if widx == ref_idx:
+                    crops.append(ref_crop)
+                    frame_meta.append({"window_index": widx, "method": method,
+                                       "shift_hr": [0, 0], "residual_lr": [0.0, 0.0],
+                                       "nontranslation_px": 0.0})
+                    continue
 
-            ref_crop = aligned[0][py:py + patch_size, px:px + patch_size]
-            ok, lap_var, veg_frac = evaluate_patch_content(
-                ref_crop, min_laplacian_var, max_vegetation_frac
-            )
-            if ok:
-                accepted = (px, py, lap_var, veg_frac)
-                break
+                dx, dy, nontrans = patch_displacement(H_inv, px, py, patch_size)
+                if nontrans > max_nontranslation_px:
+                    continue
+
+                sx, rx = snap_to_lr_grid(dx, sr_factor)
+                sy, ry = snap_to_lr_grid(dy, sr_factor)
+                crop = extract_shifted_crop(frames_bgr[widx], px, py, patch_size, sx, sy)
+                if crop is None:
+                    continue
+
+                crops.append(crop)
+                frame_meta.append({"window_index": widx, "method": method,
+                                   "shift_hr": [int(sx), int(sy)],
+                                   "residual_lr": [round(rx, 4), round(ry, 4)],
+                                   "nontranslation_px": round(nontrans, 3)})
+
+            if len(crops) < min_valid_frames:
+                continue
+            accepted = (px, py, crops, frame_meta, lap)
+            break
 
         if accepted is None:
-            # Exhausted attempts -- every candidate location in this window
-            # looked flat (sky/water) or vegetation-dominated. Skip this
-            # slot rather than writing a low-value patch.
             continue
-
-        px, py, lap_var, veg_frac = accepted
-        crop = [frame[py:py + patch_size, px:px + patch_size] for frame in aligned]
-        metrics = {"laplacian_var": round(float(lap_var), 2),
-                   "vegetation_frac": round(float(veg_frac), 3)}
-        patches.append((crop, (px, py), metrics))
-
+        px, py, crops, frame_meta, lap = accepted
+        patches.append((crops, (px, py), frame_meta, round(float(lap), 2)))
     return patches
 
 
 # --------------------------------------------------------------------------- #
-# Per-window worker (top-level function so it's picklable for multiprocessing)
+# Per-window worker
 # --------------------------------------------------------------------------- #
 
 def process_window(task):
-    (clip_name, w_idx, window_paths, split, args_dict, seed) = task
+    # OpenCV parallelizes some ops internally (ECC, resize, ...) with its own thread
+    # pool. Combined with --workers > 1 (one OS process per window), that's two
+    # layers of parallelism fighting over the same cores -- each worker process can
+    # spawn several cv2 threads, so N worker processes can spin up several times N
+    # threads, oversubscribing the machine and making more workers SLOWER instead of
+    # faster. Pin each worker process to single-threaded cv2 so --workers is the only
+    # source of parallelism; see the --workers help text for how to check this is
+    # actually paying off on your machine.
+    cv2.setNumThreads(1)
+
+    (clip_name, w_idx, window_paths, split, cfg, seed) = task
     rng = random.Random(seed)
+    rng_np = np.random.default_rng(seed)
 
     frames_bgr = [cv2.imread(str(p)) for p in window_paths]
     if any(f is None for f in frames_bgr):
         return f"  [{clip_name}] window {w_idx}: unreadable frame(s), skipping"
 
-    result = build_window(
-        frames_bgr, args_dict["ecc_iterations"], args_dict["ecc_eps"],
-        args_dict["min_valid_frames"], args_dict["align_max_dim"],
-    )
+    result = build_window(frames_bgr, cfg["ecc_iterations"], cfg["ecc_eps"],
+                          cfg["min_valid_frames"], cfg["align_max_dim"])
     if result is None:
         return f"  [{clip_name}] window {w_idx}: not enough frames aligned, skipping"
-    aligned, masks, ref_idx_in_window, methods = result
+    ref_idx, entries = result
 
     patches = sample_patches(
-        aligned, masks, args_dict["patch_size"], args_dict["patches_per_window"],
-        args_dict["border_margin"], rng,
-        min_laplacian_var=args_dict["min_laplacian_var"],
-        max_vegetation_frac=args_dict["max_vegetation_frac"],
-        max_attempts=args_dict["texture_max_attempts"],
+        frames_bgr, ref_idx, entries, cfg["patch_size"], cfg["patches_per_window"],
+        cfg["border_margin"], rng, cfg["sr_factor"], cfg["max_nontranslation_px"],
+        cfg["min_valid_frames"], min_laplacian_var=cfg["min_laplacian_var"],
+        max_attempts=cfg["texture_max_attempts"],
     )
     if not patches:
-        return (f"  [{clip_name}] window {w_idx}: no patches passed content filters "
-                f"(or common region smaller than patch_size={args_dict['patch_size']}), skipping")
+        return (f"  [{clip_name}] window {w_idx}: no patches passed filters "
+                f"(or region smaller than patch_size={cfg['patch_size']}), skipping")
 
-    for p_idx, (crop_frames, (px, py), metrics) in enumerate(patches):
+    # One blur AND one noise-LEVEL draw for the whole window: every patch/frame cut
+    # from this burst shares them (see sample_window_blur / sample_window_noise
+    # docstrings -- the actual injected noise VALUES still differ per frame, since
+    # degrade_to_lr draws a fresh random sample every time it's called below).
+    blur_sigma_w = sample_window_blur(cfg, rng_np)
+    shot_noise_w, read_noise_w = sample_window_noise(cfg, rng_np)
+
+    spreads = []
+    for p_idx, (crop_frames, (px, py), frame_meta, lap_var) in enumerate(patches):
         scene_name = f"{clip_name}_w{w_idx:05d}_p{p_idx:02d}"
-        scene_dir = Path(args_dict["outdir"]) / split / scene_name
-        (scene_dir / "lr").mkdir(parents=True, exist_ok=True)
+        hr = crop_frames[0]
 
-        hr = crop_frames[0]  # reference is always index 0
+        scene_dir = Path(cfg["outdir"]) / split / scene_name
+        (scene_dir / "lr").mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(scene_dir / "hr.png"), hr)
 
-        lr_size = args_dict["patch_size"] // args_dict["sr_factor"]
+        lr_frames = []
         for k, frame in enumerate(crop_frames):
-            lr_frame = cv2.resize(frame, (lr_size, lr_size), interpolation=cv2.INTER_AREA)
-            cv2.imwrite(str(scene_dir / "lr" / f"im_{k:02d}.png"), lr_frame)
+            lr = degrade_to_lr(frame, cfg["sr_factor"], blur_sigma_w,
+                               read_noise_w, shot_noise_w, rng_np)
+            cv2.imwrite(str(scene_dir / "lr" / f"im_{k:02d}.png"), lr)
+            lr_frames.append(lr)
+
+        phase_mean, phase_max = measure_phase_spread(lr_frames)
+        spreads.append(phase_mean)
 
         meta = {
             "clip": clip_name,
             "window_index": w_idx,
-            "reference_frame": str(window_paths[ref_idx_in_window].name),
+            "reference_frame": str(window_paths[ref_idx].name),
             "source_frames": [p.name for p in window_paths],
-            "alignment_methods": methods,
+            # burst_frame_order[k] is the source_frames index written to
+            # lr/im_{k}.png -- the burst is reference-first, source_frames is
+            # temporal, so these are NOT the same ordering.
+            "burst_frame_order": [fm["window_index"] for fm in frame_meta],
+            "alignment_methods": [fm["method"] for fm in frame_meta],
+            "frames": frame_meta,
             "burst_size": len(crop_frames),
-            "patch_size": args_dict["patch_size"],
-            "sr_factor": args_dict["sr_factor"],
+            "patch_size": cfg["patch_size"],
+            "sr_factor": cfg["sr_factor"],
             "patch_origin_xy": [int(px), int(py)],
             "reference_index": 0,
-            "laplacian_var": metrics["laplacian_var"],
-            "vegetation_frac": metrics["vegetation_frac"],
+            "laplacian_var": lap_var,
+            "degradation": {"blur_sigma": round(blur_sigma_w, 4),
+                            "blur_sigma_range": [cfg["blur_sigma_min"], cfg["blur_sigma_max"]],
+                            "noise_model": cfg["noise_model"],
+                            "shot_noise": round(shot_noise_w, 6),
+                            "read_noise": round(read_noise_w, 6),
+                            "shot_noise_range": [cfg["shot_noise_min"], cfg["shot_noise_max"]],
+                            "read_noise_range": [cfg["read_noise_min"], cfg["read_noise_max"]],
+                            "downsample": "INTER_AREA"},
+            "phase_spread_mean_lr_px": round(phase_mean, 4),
+            "phase_spread_max_lr_px": round(phase_max, 4),
         }
         with open(scene_dir / "meta.json", "w") as f:
             json.dump(meta, f, indent=2)
 
+    note = f", phase {np.mean(spreads):.3f}" if spreads else ""
     return (f"  [{clip_name}] window {w_idx} [{split}]: {len(patches[0][0])} frames, "
-            f"{len(patches)} patch(es) written")
+            f"{len(patches)} patch(es){note}")
 
 
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 
-def collect_tasks(frames_dir, clip_name, args):
+def collect_tasks(frames_dir, clip_name, args, cfg):
     frame_paths = sorted(Path(frames_dir).glob("*.png"))
     if len(frame_paths) < args.burst_size:
         print(f"  skip {clip_name}: only {len(frame_paths)} frames, need >= {args.burst_size}")
         return []
-
     n_windows = 1 + (len(frame_paths) - args.burst_size) // args.stride
-    val_start_window = int(n_windows * (1 - args.val_fraction))
-
-    args_dict = {
-        "ecc_iterations": args.ecc_iterations, "ecc_eps": args.ecc_eps,
-        "min_valid_frames": args.min_valid_frames, "align_max_dim": args.align_max_dim,
-        "patch_size": args.patch_size, "patches_per_window": args.patches_per_window,
-        "border_margin": args.border_margin, "outdir": args.outdir, "sr_factor": args.sr_factor,
-        "min_laplacian_var": args.min_laplacian_var,
-        "max_vegetation_frac": args.max_vegetation_frac,
-        "texture_max_attempts": args.texture_max_attempts,
-    }
-
+    window_indices = list(range(n_windows))
+    if args.window_fraction < 1.0:
+        # Systematic (evenly spaced across the clip), not random and not a first/last
+        # slice: every clip stays represented across its FULL duration, just more thinly
+        # sampled -- so whatever lighting/motion/scene variation happens over the course
+        # of a clip is still present in the reduced set, instead of being concentrated in
+        # (or missing from) whichever slice survived. This is what keeps a shrunk dataset
+        # diverse rather than just smaller.
+        step = max(1, round(1.0 / args.window_fraction))
+        window_indices = window_indices[::step]
+    val_start = int(len(window_indices) * (1 - args.val_fraction))
     tasks = []
-    for w_idx in range(n_windows):
+    for new_idx, w_idx in enumerate(window_indices):
         start = w_idx * args.stride
-        window_paths = frame_paths[start:start + args.burst_size]
-        split = "val" if w_idx >= val_start_window else "train"
-        tasks.append((clip_name, w_idx, window_paths, split, args_dict, args.seed + w_idx))
+        tasks.append((clip_name, w_idx, frame_paths[start:start + args.burst_size],
+                      "val" if new_idx >= val_start else "train", cfg, args.seed + w_idx))
     return tasks
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--frames_dir", type=str, required=True,
-                     help="directory of extracted frames for ONE clip (from extract_frames.py), "
-                          "or a parent directory containing multiple clip subfolders with --multi_clip")
+                    help="a clip folder of frame_*.png, or (with --multi_clip) a parent "
+                         "folder of such clip folders, e.g. frames/GX010087/frame_000001.png")
     ap.add_argument("--multi_clip", action="store_true",
-                     help="treat --frames_dir as a parent of per-clip subfolders")
+                    help="treat --frames_dir as a parent of per-clip subfolders")
     ap.add_argument("--outdir", type=str, required=True)
     ap.add_argument("--burst_size", type=int, default=14)
     ap.add_argument("--stride", type=int, default=None,
-                     help="window step; default = burst_size // 2 (50%% overlap)")
+                    help="window step; default = burst_size // 2 (50%% overlap)")
     ap.add_argument("--sr_factor", type=int, default=4)
-    ap.add_argument("--patch_size", type=int, default=384, help="HR patch size in pixels")
+    ap.add_argument("--patch_size", type=int, default=384)
     ap.add_argument("--patches_per_window", type=int, default=2)
-    ap.add_argument("--border_margin", type=int, default=8,
-                     help="extra inset (px) from the common valid region, beyond mask intersection")
+    ap.add_argument("--border_margin", type=int, default=8)
     ap.add_argument("--min_valid_frames", type=int, default=None,
-                     help="drop a window if fewer than this many frames align; default = burst_size // 2")
-    ap.add_argument("--val_fraction", type=float, default=0.1,
-                     help="fraction of each clip's windows (temporally last) reserved for val")
+                    help="drop a window if fewer than this many frames align; "
+                         "default = burst_size // 2")
+    ap.add_argument("--val_fraction", type=float, default=0.1)
+    ap.add_argument("--window_fraction", type=float, default=0.5,
+                    help="keep only this fraction of windows per clip, evenly spaced across "
+                         "each clip's full duration (systematic, not random, not a first/last "
+                         "slice) -- use this to shrink the dataset while every clip stays "
+                         "represented across its whole timespan. 0.5 keeps every other window "
+                         "(~half the dataset, ~half the build time). Applied before the "
+                         "train/val split, so the temporal holdout still works the same way.")
     ap.add_argument("--align_max_dim", type=int, default=640,
-                     help="downscale frames to this many px (long side) for alignment estimation "
-                          "only; the homography is rescaled and applied at full resolution. This is "
-                          "the main speed knob -- ECC at native 4K/5.3K is ~20-50x slower for "
-                          "essentially no accuracy gain, since output is downsampled by sr_factor "
-                          "anyway. Raise it only if alignment quality looks poor at the default.")
+                    help="downscale frames to this many px (long side) for alignment "
+                         "estimation only; the homography is rescaled and applied at full "
+                         "resolution. Main speed knob -- raise only if alignment looks poor.")
     ap.add_argument("--ecc_iterations", type=int, default=200)
     ap.add_argument("--ecc_eps", type=float, default=1e-6)
+    ap.add_argument("--max_nontranslation_px", type=float, default=1.5,
+                    help="drop a frame from a patch if its homography applies more than this "
+                         "much rotation/scale/perspective across the patch (an integer-shift "
+                         "crop can't represent that).")
+
+    ap.add_argument("--blur_sigma_min", type=float, default=0.0,
+                    help="low end of the per-window Gaussian blur sigma range (optical PSF + "
+                         "sensor MTF, applied at HR before downsampling). Try 0.4-1.2 together "
+                         "with --blur_sigma_max; 0/0 (the default) means no blur.")
+    ap.add_argument("--blur_sigma_max", type=float, default=0.0)
+    ap.add_argument("--shot_noise_min", type=float, default=0.0,
+                    help="low end of the per-frame signal-dependent noise range, normalized "
+                         "[0,1]. Try 0.0004-0.0012. Ignored under --noise_model burstormer.")
+    ap.add_argument("--shot_noise_max", type=float, default=0.0)
+    ap.add_argument("--read_noise_min", type=float, default=0.0,
+                    help="low end of the per-frame signal-independent sensor noise range, "
+                         "normalized [0,1]. Try 0.002-0.006. Ignored under --noise_model "
+                         "burstormer.")
+    ap.add_argument("--read_noise_max", type=float, default=0.0)
+    ap.add_argument("--noise_model", choices=["uniform", "burstormer"], default="uniform",
+                    help="'uniform' (default) draws shot_noise/read_noise independently per "
+                         "frame from the ranges above. 'burstormer' instead reproduces "
+                         "Burstormer's own physically-correlated (shot, read) sampling (Brooks "
+                         "et al., CVPR 2019) and ignores the shot/read range flags.")
+
     ap.add_argument("--min_laplacian_var", type=float, default=15.0,
-                     help="minimum Laplacian variance (texture/focus measure) a candidate patch's "
-                          "reference crop must have to be kept. Patches below this look flat/"
-                          "low-detail -- sky, still water, blank walls, out-of-focus background. "
-                          "0 (default) disables this filter. Flat regions typically fall well under "
-                          "~20-30; textured regions run into the hundreds+, but tune to your footage "
-                          "-- audit the laplacian_var values written to meta.json on a trial run "
-                          "before locking in a threshold.")
-    ap.add_argument("--max_vegetation_frac", type=float, default=0.70,
-                     help="reject a candidate patch if more than this fraction of its reference "
-                          "crop looks green/foliage-colored (rough HSV heuristic for grass/trees/"
-                          "leaves). 1.0 (default) disables this filter. NOTE: grass/foliage is often "
-                          "HIGH texture (lots of fine edges), so --min_laplacian_var alone will NOT "
-                          "catch it -- this is a separate color-based heuristic, and it will also "
-                          "flag other green content (painted walls, green fabric, etc.). Try 0.5-0.7 "
-                          "as a starting point.")
+                    help="reject a candidate patch if it's this low-texture (0 disables).")
     ap.add_argument("--texture_max_attempts", type=int, default=25,
-                     help="random resample attempts per patch slot before giving up on that slot, "
-                          "when --min_laplacian_var and/or --max_vegetation_frac are active")
+                    help="random patch locations to try per window before giving up.")
     ap.add_argument("--workers", type=int, default=1,
-                     help="parallel worker processes (windows are independent). Try os.cpu_count().")
+                    help="parallel worker processes (windows are independent). More isn't "
+                         "always faster -- each worker holds burst_size full-res frames in "
+                         "memory and cv2 is pinned to 1 thread per worker specifically so this "
+                         "flag is the only source of parallelism (see process_window). Don't "
+                         "guess a number: run benchmark_workers.py on a sample of your actual "
+                         "footage to find the worker count where throughput stops improving.")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -498,38 +619,62 @@ def main():
         args.stride = max(1, args.burst_size // 2)
     if args.min_valid_frames is None:
         args.min_valid_frames = max(2, args.burst_size // 2)
+    if not (0.0 < args.window_fraction <= 1.0):
+        ap.error(f"--window_fraction ({args.window_fraction}) must be in (0, 1]")
+    for lo, hi, name in [(args.blur_sigma_min, args.blur_sigma_max, "blur_sigma"),
+                          (args.shot_noise_min, args.shot_noise_max, "shot_noise"),
+                          (args.read_noise_min, args.read_noise_max, "read_noise")]:
+        if lo > hi:
+            ap.error(f"--{name}_min ({lo}) must be <= --{name}_max ({hi})")
 
-    if args.multi_clip:
-        clip_dirs = sorted(d for d in Path(args.frames_dir).iterdir() if d.is_dir())
-    else:
-        clip_dirs = [Path(args.frames_dir)]
+    cfg = {
+        "ecc_iterations": args.ecc_iterations, "ecc_eps": args.ecc_eps,
+        "min_valid_frames": args.min_valid_frames, "align_max_dim": args.align_max_dim,
+        "patch_size": args.patch_size, "patches_per_window": args.patches_per_window,
+        "border_margin": args.border_margin, "outdir": args.outdir,
+        "sr_factor": args.sr_factor,
+        "min_laplacian_var": args.min_laplacian_var,
+        "texture_max_attempts": args.texture_max_attempts,
+        "max_nontranslation_px": args.max_nontranslation_px,
+        "blur_sigma_min": args.blur_sigma_min, "blur_sigma_max": args.blur_sigma_max,
+        "shot_noise_min": args.shot_noise_min, "shot_noise_max": args.shot_noise_max,
+        "read_noise_min": args.read_noise_min, "read_noise_max": args.read_noise_max,
+        "noise_model": args.noise_model,
+    }
 
+    clip_dirs = (sorted(d for d in Path(args.frames_dir).iterdir() if d.is_dir())
+                 if args.multi_clip else [Path(args.frames_dir)])
     all_tasks = []
     for clip_dir in clip_dirs:
-        all_tasks.extend(collect_tasks(clip_dir, clip_dir.name, args))
+        all_tasks.extend(collect_tasks(clip_dir, clip_dir.name, args, cfg))
 
-    filter_note = ""
-    if args.min_laplacian_var > 0.0 or args.max_vegetation_frac < 1.0:
-        filter_note = (f", min_laplacian_var={args.min_laplacian_var}, "
-                        f"max_vegetation_frac={args.max_vegetation_frac}, "
-                        f"texture_max_attempts={args.texture_max_attempts}")
+    os.makedirs(args.outdir, exist_ok=True)
+    with open(Path(args.outdir) / "build_config.json", "w") as f:
+        json.dump(vars(args), f, indent=2)
 
-    print(f"{len(all_tasks)} window(s) queued across {len(clip_dirs)} clip(s), "
-          f"align_max_dim={args.align_max_dim}, workers={args.workers}{filter_note}")
+    print(f"{len(all_tasks)} window(s) across {len(clip_dirs)} clip(s) "
+          f"(window_fraction={args.window_fraction}) | "
+          f"blur=[{args.blur_sigma_min},{args.blur_sigma_max}]/window "
+          f"noise_model={args.noise_model} "
+          f"shot=[{args.shot_noise_min},{args.shot_noise_max}] "
+          f"read=[{args.read_noise_min},{args.read_noise_max}]/frame "
+          f"workers={args.workers}")
 
-    n_scenes_written = 0
+    n = 0
     if args.workers <= 1:
         for task in all_tasks:
             print(process_window(task))
-            n_scenes_written += 1
+            n += 1
     else:
         with ProcessPoolExecutor(max_workers=args.workers) as ex:
-            futures = [ex.submit(process_window, task) for task in all_tasks]
+            futures = [ex.submit(process_window, t) for t in all_tasks]
             for fut in as_completed(futures):
                 print(fut.result())
-                n_scenes_written += 1
+                n += 1
 
-    print(f"\nDone. {n_scenes_written} window(s) processed under {args.outdir}/{{train,val}}/")
+    print(f"\nDone. {n} window(s) under {args.outdir}/{{train,val}}/")
+    print(f"Config saved to {args.outdir}/build_config.json -- keep it, the "
+          f"degradation settings must match when you build the other split.")
 
 
 if __name__ == "__main__":
